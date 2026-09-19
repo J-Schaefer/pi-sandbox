@@ -41,20 +41,15 @@ sudo chmod u+s $(which bwrap)
 
 1. Save the `pi-sandbox.sh` script to a location in your PATH (e.g., `~/.local/bin/pi-sandbox` or `~/bin/pi-sandbox`).
 2. Make the script executable:
+3. 
 ```bash
 chmod +x ~/.local/bin/pi-sandbox
-
-
 ```
 
-
-
-```
 3. *(Optional)* Add an alias to your `~/.bashrc` or `~/.zshrc` for quick access:
-   ```bash
+4. 
+```bash
    alias pi-sandbox='~/.local/bin/pi-sandbox'
-   
-
 ```
 
 ## 💻 Usage
