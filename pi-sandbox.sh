@@ -1,34 +1,45 @@
 #!/bin/bash
 set -euo pipefail
 
-PI_DIR="${HOME}/.pi"
-WORKSPACE="/tmp/pi-agent-workspace"    # The fallback default
-USER_LOCAL="${HOME}/.local"              # Host dir of user-local installs
-USER_LOCAL_MOUNT="/userlocal"          # Where it appears inside the sandbox
-NVM_DIR_HOST="${NVM_DIR:-${HOME}/.config/nvm}"  # Matches your bashrc
-NVM_MOUNT="/nvm"                       # Where nvm appears inside the sandbox
-declare -a EXTRA_BINDS=()              # Raw -d/--directories specs
+PI_DIR="$HOME/.pi"
+WORKSPACE="$HOME/.pi-agent/workspace"        # host dir bound rw at /home/agent/workspace
+USER_LOCAL="$HOME/.local"                   # host user-local installs (ro)
+NVM_DIR_HOST="${NVM_DIR:-$HOME/.config/nvm}" # matches your bashrc (ro)
+HOME_AGENT="/home/agent"                    # sandbox home (tmpfs)
+
+declare -a EXTRA_BINDS=()
+
+# Resolve a directory to a symlink-free absolute path (bwrap needs absolute paths)
+abs() { ( cd -- "$1" 2>/dev/null && pwd -P ); }
 
 usage() {
     cat <<EOF
 Usage: $(basename "$0") [-w WORKSPACE] [-d HOST_DIR[:SANDBOX_DIR]] [--] [COMMAND...]
 
-  -w, --workspace DIR   Host directory to bind as /workspace
+  -w, --workspace DIR   Host directory bound rw at ${HOME_AGENT}/workspace
                         (default: ${WORKSPACE})
 
   -d, --directories SPEC
                         Bind an extra host directory into the sandbox.
                         SPEC is one of:
-                          /host/path                 -> read-write at /mnt/<basename>
-                          /host/path:/sandbox/path   -> read-write at /sandbox/path
+                          /host/path                 -> rw at /mnt/<basename>
+                          /host/path:/sandbox/path   -> rw at /sandbox/path
                           ro:/host/path[:/sandbox]   -> read-only bind
-                        May be given multiple times.
+                        May be given multiple times. Destinations under
+                        /usr, /etc, /proc, /dev, /sys, /tmp, /home, /run
+                        or /boot are rejected.
 
   -h, --help            Show this help and exit.
 
-  ~/.local is bound read-only at ${USER_LOCAL_MOUNT}.
-  nvm (${NVM_DIR_HOST}) is bound read-only at ${NVM_MOUNT} and the
-  active node bin directory is prepended to PATH.
+Sandbox layout (home = ${HOME_AGENT}, a tmpfs):
+  ${HOME_AGENT}/workspace  rw   ${WORKSPACE}
+  ${HOME_AGENT}/.local     ro   ${USER_LOCAL}
+  ${HOME_AGENT}/.nvm       ro   ${NVM_DIR_HOST}
+  ${HOME_AGENT}/.pi        ro   ${PI_DIR}  (${HOME_AGENT}/.pi/agent is rw)
+
+Network is shared with the host (outbound internet works). Export
+PI_PROXY=http://host:port before invoking to route via a local proxy.
+Only the whitelisted variables are exported into the sandbox.
 
 Remaining arguments are run inside the sandbox (default: /bin/bash).
 EOF
@@ -59,28 +70,34 @@ while [[ $# -gt 0 ]]; do
 done
 
 AGENT_ARGS=("$@")
-[[ ${#AGENT_ARGS[@]} -eq 0 ]] && AGENT_ARGS=(/bin/bash)
+if [[ ${#AGENT_ARGS[@]} -eq 0 ]]; then AGENT_ARGS=(/bin/bash); fi
 
-# 2. Ensure directories exist
-mkdir -p "${PI_DIR}/agent/sessions"
-mkdir -p "${WORKSPACE}"
+# 2. Ensure host directories exist
+mkdir -p "${PI_DIR}/agent/sessions" "${WORKSPACE}"
 
-# 3. Convert workspace to an absolute path (bwrap strictly requires absolute paths)
-WORKSPACE=$(cd "${WORKSPACE}" && pwd)
+# 3. bwrap requires absolute paths
+WORKSPACE="$(abs "${WORKSPACE}")" || { echo "error: cannot resolve workspace: ${WORKSPACE}" >&2; exit 1; }
 
-# 4. Read-only bind of ~/.local at ${USER_LOCAL_MOUNT} (only if it exists on the host).
-declare -a USER_LOCAL_ARGS=()
+# 4. Dotdirs into the sandbox home
+declare -a HOME_ARGS=()
+have_userlocal=0
 if [[ -d "${USER_LOCAL}" ]]; then
-    USER_LOCAL=$(cd "${USER_LOCAL}" && pwd)
-    USER_LOCAL_ARGS=(
-        --dir "${USER_LOCAL_MOUNT}"
-        --ro-bind "${USER_LOCAL}" "${USER_LOCAL_MOUNT}"
-    )
+    USER_LOCAL="$(abs "${USER_LOCAL}")" || { echo "error: cannot resolve ${USER_LOCAL}" >&2; exit 1; }
+    HOME_ARGS+=(--dir "${HOME_AGENT}/.local" --ro-bind "${USER_LOCAL}" "${HOME_AGENT}/.local")
+    have_userlocal=1
 fi
 
-# 5. Resolve the active nvm node install (host side) and bind nvm read-only.
+if [[ -d "${PI_DIR}" ]]; then
+    PI_DIR="$(abs "${PI_DIR}")" || { echo "error: cannot resolve ${PI_DIR}" >&2; exit 1; }
+    HOME_ARGS+=(--dir "${HOME_AGENT}/.pi" --ro-bind "${PI_DIR}" "${HOME_AGENT}/.pi")
+    if [[ -w "${PI_DIR}/agent" ]]; then
+        HOME_ARGS+=(--dir "${HOME_AGENT}/.pi/agent" --bind "${PI_DIR}/agent" "${HOME_AGENT}/.pi/agent")
+    fi
+fi
+
+# 5. Resolve the active nvm node install (host side) and bind nvm read-only
 resolve_nvm_node_bin() {
-    local candidate=""
+    local candidate
 
     # Preferred: ask nvm which node the "default" alias resolves to.
     if [[ -s "${NVM_DIR_HOST}/nvm.sh" ]]; then
@@ -91,69 +108,76 @@ resolve_nvm_node_bin() {
             . "$NVM_DIR/nvm.sh" >/dev/null 2>&1
             nvm which default 2>/dev/null || true
         )"
-        candidate="${candidate%%$'\n'*}"
-        candidate="${candidate%$'\r'}"
-    fi
-    if [[ -x "$candidate" ]]; then
-        printf '%s\n' "$candidate"
-        return 0
+        if [[ -n "${candidate:-}" && -x "${candidate:-}" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
     fi
 
     # Fallback: newest installed version, by version sort.
-    local -a nodes=()
+    local -a nodes
     shopt -s nullglob
-    nodes=( "$NVM_DIR_HOST"/versions/node/*/bin/node )
+    nodes=("${NVM_DIR_HOST}"/versions/node/*/bin/node)
     shopt -u nullglob
-    ((${#nodes[@]})) || return 1
-    printf '%s\n' "${nodes[@]}" | sort -V | tail -n1
+    if (( ${#nodes[@]} )); then
+        printf '%s\n' "${nodes[@]}" | sort -V | tail -n1
+        return 0
+    fi
+    return 1
 }
 
 declare -a NVM_ARGS=()
+have_nvm=0
 NODE_BIN_DIR_SANDBOX=""
 if [[ -d "${NVM_DIR_HOST}" ]]; then
-    NVM_DIR_HOST=$(cd "${NVM_DIR_HOST}" && pwd)
+    NVM_DIR_HOST="$(abs "${NVM_DIR_HOST}")" || { echo "error: cannot resolve ${NVM_DIR_HOST}" >&2; exit 1; }
+
+    NVM_ARGS=(--dir "${HOME_AGENT}/.nvm" --ro-bind "${NVM_DIR_HOST}" "${HOME_AGENT}/.nvm")
+    have_nvm=1
 
     NODE_BIN="$(resolve_nvm_node_bin || true)"
     if [[ -n "${NODE_BIN}" ]]; then
         NODE_BIN_DIR="$(dirname "${NODE_BIN}")"
-        NODE_BIN_DIR_SANDBOX="${NVM_MOUNT}/${NODE_BIN_DIR#"${NVM_DIR_HOST}"/}"
+        if [[ "${NODE_BIN_DIR}" == "${NVM_DIR_HOST}"/* ]]; then
+            NODE_BIN_DIR_SANDBOX="${HOME_AGENT}/.nvm/${NODE_BIN_DIR#"${NVM_DIR_HOST}"/}"
+        fi
     else
         echo "warning: nvm found at ${NVM_DIR_HOST} but no node install detected" >&2
     fi
-
-    NVM_ARGS=(
-        --dir "${NVM_MOUNT}"
-        --ro-bind "${NVM_DIR_HOST}" "${NVM_MOUNT}"
-    )
 fi
 
 # 6. Resolve the extra directory binds into bwrap arguments
 declare -a BIND_ARGS=()
-for spec in ${EXTRA_BINDS[@]+"${EXTRA_BINDS[@]}"}; do
-    mode="--bind"
+for spec in "${EXTRA_BINDS[@]}"; do
+    mode=--bind
     if [[ "${spec}" == ro:* ]]; then
-        mode="--ro-bind"
+        mode=--ro-bind
         spec="${spec#ro:}"
     fi
 
     # Split HOST[:SANDBOX]
-    if [[ "{$spec}" == *:* ]]; then
+    if [[ "${spec}" == *:* ]]; then
         host="${spec%%:*}"
         guest="${spec#*:}"
     else
-        host="$spec"
-        guest="/mnt/$(basename "$host")"
+        host="${spec}"
+        guest="/mnt/$(basename "${spec}")"
     fi
 
     # Validate
-    [[ -d "$host" ]] || { echo "error: not a directory: $host" >&2; exit 1; }
+    [[ -d "${host}" ]] || { echo "error: not a directory: ${host}" >&2; exit 1; }
     [[ "${guest}" == /* ]] || { echo "error: sandbox path must be absolute: ${guest}" >&2; exit 1; }
+    case "${guest}" in
+        /|/usr*|/etc*|/proc*|/dev*|/sys*|/tmp*|/home*|/run*|/boot*)
+            echo "error: refusing to bind over protected path: ${guest}" >&2
+            exit 1
+            ;;
+    esac
 
-    host=$(cd "$host" && pwd)   # bwrap needs absolute source paths
+    host="$(abs "${host}")" || { echo "error: cannot resolve: ${host}" >&2; exit 1; }
 
-    # Make sure the parent mount point exists inside the sandbox
-    BIND_ARGS+=(--dir "$(dirname "${guest}")")
-    BIND_ARGS+=("${mode}" "${host}" "${guest}")
+    # Parent of the destination is created for us by bwrap; keep it tidy anyway
+    BIND_ARGS+=(--dir "$(dirname "${guest}")" "${mode}" "${host}" "${guest}")
 done
 
 # 7. Build the in-sandbox PATH
@@ -161,26 +185,35 @@ declare -a PATH_PARTS=()
 if [[ -n "${NODE_BIN_DIR_SANDBOX}" ]]; then
     PATH_PARTS+=("${NODE_BIN_DIR_SANDBOX}")   # node/npm/npx from nvm
 fi
-if ((${#USER_LOCAL_ARGS[@]})); then
-    PATH_PARTS+=("${USER_LOCAL_MOUNT}/bin")
+if (( have_userlocal )); then
+    PATH_PARTS+=("${HOME_AGENT}/.local/bin")
 fi
 PATH_PARTS+=(/usr/local/bin /usr/bin /bin)
 SANDBOX_PATH="$(IFS=:; printf '%s' "${PATH_PARTS[*]}")"
 
-# 8. Environment for the sandbox
-declare -a ENV_ARGS=(--setenv PATH "$SANDBOX_PATH" --setenv npm_config_cache /tmp/.npm)
-if ((${#NVM_ARGS[@]})); then
-    ENV_ARGS+=(--setenv NVM_DIR "$NVM_MOUNT")
-    [[ -n "$NODE_BIN_DIR_SANDBOX" ]] && ENV_ARGS+=(--setenv NVM_BIN "$NODE_BIN_DIR_SANDBOX")
+# 8. Environment for the sandbox (explicit whitelist; --clearenv below)
+declare -a ENV_ARGS=(
+    --setenv PATH "${SANDBOX_PATH}"
+    --setenv HOME "${HOME_AGENT}"
+    --setenv USER "${USER:-agent}"
+    --setenv TERM "${TERM:-dumb}"
+    --setenv npm_config_cache /tmp/.npm
+)
+if (( have_nvm )); then
+    ENV_ARGS+=(--setenv NVM_DIR "${HOME_AGENT}/.nvm")
+    if [[ -n "${NODE_BIN_DIR_SANDBOX}" ]]; then
+        ENV_ARGS+=(--setenv NVM_BIN "${NODE_BIN_DIR_SANDBOX}")
+    fi
 fi
-# Proxy is routing, not isolation: only inject if one is actually configured/running
 if [[ -n "${PI_PROXY:-}" ]]; then
-    ENV_ARGS+=(--setenv HTTP_PROXY "$PI_PROXY" --setenv HTTPS_PROXY "$PI_PROXY"
+    # Routing, not isolation: only inject if a proxy actually exists
+    ENV_ARGS+=(--setenv HTTP_PROXY "${PI_PROXY}" --setenv HTTPS_PROXY "${PI_PROXY}"
                --setenv NO_PROXY "localhost,127.0.0.1")
 fi
 
-
 # 9. Execute the sandbox
+# --unshare-all = user-try, ipc, pid, net, uts, cgroup-try [^739a73#118-120]
+# --share-net then retains host networking (outbound internet stays on) [^739a73#122-124]
 exec bwrap \
     --unshare-all \
     --share-net \
@@ -197,16 +230,13 @@ exec bwrap \
     --dev /dev \
     --size 2147483648 \
     --tmpfs /tmp \
-    --tmpfs /home/agent \
-    --ro-bind "${PI_DIR}" "${PI_DIR}" \
-    --bind "${PI_DIR}/agent" "${PI_DIR}/agent" \
-    --bind "${WORKSPACE}" /workspace \
-    "${USER_LOCAL_ARGS[@]}" \
+    --tmpfs /home \
+    --tmpfs "${HOME_AGENT}" \
+    --bind "${WORKSPACE}" "${HOME_AGENT}/workspace" \
+    "${HOME_ARGS[@]}" \
     "${NVM_ARGS[@]}" \
     "${BIND_ARGS[@]}" \
     --clearenv \
-    --setenv HOME /home/agent \
-    --setenv TERM "${TERM:-dumb}" \
     "${ENV_ARGS[@]}" \
-    --chdir /workspace \
+    --chdir "${HOME_AGENT}/workspace" \
     "${AGENT_ARGS[@]}"
