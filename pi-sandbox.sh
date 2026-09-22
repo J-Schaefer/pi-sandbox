@@ -3,7 +3,9 @@ set -euo pipefail
 
 PI_DIR="$HOME/.pi"
 WORKSPACE="/tmp/pi-agent-workspace" # The fallback default
-declare -a EXTRA_BINDS=()           # Raw -d/--directories specs
+USER_LOCAL="$HOME/.local"          # Host dir of user scripts
+USER_LOCAL_MOUNT="/userlocal"            # Where it appears inside the sandbox
+declare -a EXTRA_BINDS=()            # Raw -d/--directories specs
 
 usage() {
     cat <<EOF
@@ -60,7 +62,17 @@ mkdir -p "$WORKSPACE"
 # 3. Convert workspace to an absolute path (bwrap strictly requires absolute paths)
 WORKSPACE=$(cd "$WORKSPACE" && pwd)
 
-# 4. Resolve the extra directory binds into bwrap arguments
+# 4. Read-only bind of ~/.local/bin at /userbin (only if it exists on the host).
+declare -a USER_BIN_ARGS=()
+if [[ -d "$USER_LOCAL" ]]; then
+    USER_LOCAL=$(cd "$USER_LOCAL" && pwd)
+    USER_BIN_ARGS=(
+        --dir "$USER_LOCAL_MOUNT"
+        --ro-bind "$USER_LOCAL" "$USER_LOCAL_MOUNT"
+    )
+fi
+
+# 5. Resolve the extra directory binds into bwrap arguments
 declare -a BIND_ARGS=()
 for spec in ${EXTRA_BINDS[@]+"${EXTRA_BINDS[@]}"}; do
     mode="--bind"
@@ -89,7 +101,14 @@ for spec in ${EXTRA_BINDS[@]+"${EXTRA_BINDS[@]}"}; do
     BIND_ARGS+=("$mode" "$host" "$guest")
 done
 
-# 5. Execute the sandbox
+# 6. Build the in-sandbox PATH, prepending /userbin when it is mounted
+if [[ ${#USER_BIN_ARGS[@]} -gt 0 ]]; then
+    SANDBOX_PATH="${USER_LOCAL_MOUNT}/bin:/usr/local/bin:/usr/bin:/bin"
+else
+    SANDBOX_PATH="/usr/local/bin:/usr/bin:/bin"
+fi
+
+# 7. Execute the sandbox
 exec bwrap \
     --unshare-uts \
     --hostname pi-sandbox \
@@ -105,9 +124,10 @@ exec bwrap \
     --ro-bind "$PI_DIR" "$PI_DIR" \
     --bind "$PI_DIR/agent" "$PI_DIR/agent" \
     --bind "$WORKSPACE" /workspace \
+    ${USER_BIN_ARGS[@]+"${USER_BIN_ARGS[@]}"} \
     ${BIND_ARGS[@]+"${BIND_ARGS[@]}"} \
+    --setenv PATH "$SANDBOX_PATH" \
     --unshare-pid \
     --die-with-parent \
     --chdir /workspace \
     "${AGENT_ARGS[@]}"
-
