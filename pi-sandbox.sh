@@ -2,10 +2,12 @@
 set -euo pipefail
 
 PI_DIR="$HOME/.pi"
-WORKSPACE="/tmp/pi-agent-workspace" # The fallback default
-USER_LOCAL="$HOME/.local"          # Host dir of user scripts
-USER_LOCAL_MOUNT="/userlocal"            # Where it appears inside the sandbox
-declare -a EXTRA_BINDS=()            # Raw -d/--directories specs
+WORKSPACE="/tmp/pi-agent-workspace"    # The fallback default
+USER_LOCAL="$HOME/.local"              # Host dir of user-local installs
+USER_LOCAL_MOUNT="/userlocal"          # Where it appears inside the sandbox
+NVM_DIR_HOST="${NVM_DIR:-$HOME/.config/nvm}"  # Matches your bashrc
+NVM_MOUNT="/nvm"                       # Where nvm appears inside the sandbox
+declare -a EXTRA_BINDS=()              # Raw -d/--directories specs
 
 usage() {
     cat <<EOF
@@ -23,6 +25,10 @@ Usage: $(basename "$0") [-w WORKSPACE] [-d HOST_DIR[:SANDBOX_DIR]] [--] [COMMAND
                         May be given multiple times.
 
   -h, --help            Show this help and exit.
+
+  ~/.local is bound read-only at $USER_LOCAL_MOUNT.
+  nvm ($NVM_DIR_HOST) is bound read-only at $NVM_MOUNT and the
+  active node bin directory is prepended to PATH.
 
 Remaining arguments are run inside the sandbox (default: /bin/bash).
 EOF
@@ -62,17 +68,66 @@ mkdir -p "$WORKSPACE"
 # 3. Convert workspace to an absolute path (bwrap strictly requires absolute paths)
 WORKSPACE=$(cd "$WORKSPACE" && pwd)
 
-# 4. Read-only bind of ~/.local/bin at /userbin (only if it exists on the host).
-declare -a USER_BIN_ARGS=()
+# 4. Read-only bind of ~/.local at $USER_LOCAL_MOUNT (only if it exists on the host).
+declare -a USER_LOCAL_ARGS=()
 if [[ -d "$USER_LOCAL" ]]; then
     USER_LOCAL=$(cd "$USER_LOCAL" && pwd)
-    USER_BIN_ARGS=(
+    USER_LOCAL_ARGS=(
         --dir "$USER_LOCAL_MOUNT"
         --ro-bind "$USER_LOCAL" "$USER_LOCAL_MOUNT"
     )
 fi
 
-# 5. Resolve the extra directory binds into bwrap arguments
+# 5. Resolve the active nvm node install (host side) and bind nvm read-only.
+resolve_nvm_node_bin() {
+    local candidate=""
+
+    # Preferred: ask nvm which node the "default" alias resolves to.
+    if [[ -s "$NVM_DIR_HOST/nvm.sh" ]]; then
+        candidate="$(
+            set +eu                      # nvm.sh is not -u/-e clean
+            export NVM_DIR="$NVM_DIR_HOST"
+            # shellcheck disable=SC1090
+            . "$NVM_DIR/nvm.sh" >/dev/null 2>&1
+            nvm which default 2>/dev/null || true
+        )"
+        candidate="${candidate%%$'\n'*}"
+        candidate="${candidate%$'\r'}"
+    fi
+    if [[ -x "$candidate" ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+
+    # Fallback: newest installed version, by version sort.
+    local -a nodes=()
+    shopt -s nullglob
+    nodes=( "$NVM_DIR_HOST"/versions/node/*/bin/node )
+    shopt -u nullglob
+    ((${#nodes[@]})) || return 1
+    printf '%s\n' "${nodes[@]}" | sort -V | tail -n1
+}
+
+declare -a NVM_ARGS=()
+NODE_BIN_DIR_SANDBOX=""
+if [[ -d "$NVM_DIR_HOST" ]]; then
+    NVM_DIR_HOST=$(cd "$NVM_DIR_HOST" && pwd)
+
+    NODE_BIN="$(resolve_nvm_node_bin || true)"
+    if [[ -n "$NODE_BIN" ]]; then
+        NODE_BIN_DIR="$(dirname "$NODE_BIN")"
+        NODE_BIN_DIR_SANDBOX="$NVM_MOUNT/${NODE_BIN_DIR#"$NVM_DIR_HOST"/}"
+    else
+        echo "warning: nvm found at $NVM_DIR_HOST but no node install detected" >&2
+    fi
+
+    NVM_ARGS=(
+        --dir "$NVM_MOUNT"
+        --ro-bind "$NVM_DIR_HOST" "$NVM_MOUNT"
+    )
+fi
+
+# 6. Resolve the extra directory binds into bwrap arguments
 declare -a BIND_ARGS=()
 for spec in ${EXTRA_BINDS[@]+"${EXTRA_BINDS[@]}"}; do
     mode="--bind"
@@ -101,14 +156,29 @@ for spec in ${EXTRA_BINDS[@]+"${EXTRA_BINDS[@]}"}; do
     BIND_ARGS+=("$mode" "$host" "$guest")
 done
 
-# 6. Build the in-sandbox PATH, prepending /userbin when it is mounted
-if [[ ${#USER_BIN_ARGS[@]} -gt 0 ]]; then
-    SANDBOX_PATH="${USER_LOCAL_MOUNT}/bin:/usr/local/bin:/usr/bin:/bin"
-else
-    SANDBOX_PATH="/usr/local/bin:/usr/bin:/bin"
+# 7. Build the in-sandbox PATH
+declare -a PATH_PARTS=()
+if [[ -n "$NODE_BIN_DIR_SANDBOX" ]]; then
+    PATH_PARTS+=("$NODE_BIN_DIR_SANDBOX")   # node/npm/npx from nvm
 fi
+if ((${#USER_LOCAL_ARGS[@]})); then
+    PATH_PARTS+=("$USER_LOCAL_MOUNT/bin")
+fi
+PATH_PARTS+=(/usr/local/bin /usr/bin /bin)
+SANDBOX_PATH="$(IFS=:; printf '%s' "${PATH_PARTS[*]}")"
 
-# 7. Execute the sandbox
+# 8. Environment for the sandbox
+declare -a ENV_ARGS=(--setenv PATH "$SANDBOX_PATH")
+if ((${#NVM_ARGS[@]})); then
+    ENV_ARGS+=(--setenv NVM_DIR "$NVM_MOUNT")
+    if [[ -n "$NODE_BIN_DIR_SANDBOX" ]]; then
+        ENV_ARGS+=(--setenv NVM_BIN "$NODE_BIN_DIR_SANDBOX")
+    fi
+fi
+# npm/node caches would otherwise land in an unmounted $HOME and fail
+ENV_ARGS+=(--setenv npm_config_cache /tmp/.npm)
+
+# 9. Execute the sandbox
 exec bwrap \
     --unshare-uts \
     --hostname pi-sandbox \
@@ -124,9 +194,10 @@ exec bwrap \
     --ro-bind "$PI_DIR" "$PI_DIR" \
     --bind "$PI_DIR/agent" "$PI_DIR/agent" \
     --bind "$WORKSPACE" /workspace \
-    ${USER_BIN_ARGS[@]+"${USER_BIN_ARGS[@]}"} \
+    ${USER_LOCAL_ARGS[@]+"${USER_LOCAL_ARGS[@]}"} \
+    ${NVM_ARGS[@]+"${NVM_ARGS[@]}"} \
     ${BIND_ARGS[@]+"${BIND_ARGS[@]}"} \
-    --setenv PATH "$SANDBOX_PATH" \
+    ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} \
     --unshare-pid \
     --die-with-parent \
     --chdir /workspace \
