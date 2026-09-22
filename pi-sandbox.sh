@@ -2,7 +2,11 @@
 set -euo pipefail
 
 PI_DIR="$HOME/.pi"
-WORKSPACE="$HOME/.pi-agent/workspace"        # host dir bound rw at $HOME_AGENT/workspace
+# Default workspace = current directory, NOT a fixed hidden folder.
+# (A fixed default like "$HOME/.pi-agent/workspace" is never populated
+# unless you remember to copy files into it -- it looks "always empty"
+# because it silently is, regardless of where you ran the script from.)
+WORKSPACE="$(pwd)"                          # host dir bound rw at $HOME_AGENT/workspace
 USER_LOCAL="$HOME/.local"                   # host user-local installs (ro)
 NVM_DIR_HOST="${NVM_DIR:-$HOME/.config/nvm}" # matches your bashrc (ro)
 SANDBOX_USER=""                             # resolved in step 2 (default: current username)
@@ -18,7 +22,7 @@ usage() {
 Usage: $(basename "$0") [-w WORKSPACE] [-u USER] [-d HOST_DIR[:SANDBOX_DIR]] [--] [COMMAND...]
 
   -w, --workspace DIR   Host directory bound rw at ${HOME_AGENT}/workspace
-                        (default: ${WORKSPACE})
+                        (default: the current directory, i.e. $(pwd))
 
   -u, --user NAME       Username inside the sandbox; also determines its
                         \$HOME (/home/NAME). Default: your current host
@@ -42,8 +46,8 @@ Usage: $(basename "$0") [-w WORKSPACE] [-u USER] [-d HOST_DIR[:SANDBOX_DIR]] [--
                           ro:/host/path[:/sandbox]   -> read-only bind
                         May be given multiple times. Destinations under
                         /usr, /etc, /proc, /dev, /sys, /tmp, /run, /boot,
-                        or already used by this script (the sandbox home
-                        root, workspace, .local, .nvm, .pi) are rejected.
+                        or the sandbox's reserved home paths (workspace,
+                        .local, .nvm, .pi) are rejected.
 
   -h, --help            Show this help and exit.
 
@@ -94,13 +98,6 @@ AGENT_ARGS=("$@")
 if [[ ${#AGENT_ARGS[@]} -eq 0 ]]; then AGENT_ARGS=(/bin/bash); fi
 
 # 2. Resolve the sandbox identity (username -> $HOME inside the sandbox)
-#
-# Default to the real host username. This is *less* isolated than a fixed
-# generic name (it exposes who you are, and it means -d binds that happen
-# to fall under your real home now land at their real path -- see step 7),
-# but compiled binaries, virtualenvs, and npm shebangs frequently embed an
-# absolute $HOME-based path and simply fail to run under a different one.
-# Use -u/--user to opt back into a generic, safer identity (e.g. -u agent).
 SANDBOX_USER="${SANDBOX_USER:-${USER:-$(id -un 2>/dev/null || echo agent)}}"
 
 # The username is embedded straight into a filesystem path below, so it
@@ -117,28 +114,18 @@ mkdir -p "${PI_DIR}/agent/sessions" "${WORKSPACE}"
 # 4. bwrap requires absolute paths
 WORKSPACE="$(abs "${WORKSPACE}")" || { echo "error: cannot resolve workspace: ${WORKSPACE}" >&2; exit 1; }
 
-# Track sandbox-home subpaths this script itself binds, so step 7 can
-# refuse to let a user-supplied -d silently shadow them. Only these exact
-# subtrees are reserved -- NOT the whole of ${HOME_AGENT} -- because when
-# --user defaults to your real username, ${HOME_AGENT} equals your actual
-# $HOME, and unrelated directories under it (e.g. ~/ros2_ws) must remain
-# bindable.
-declare -a RESERVED_HOME_PATHS=("${HOME_AGENT}/workspace")
-
 # 5. Dotdirs into the sandbox home
 declare -a HOME_ARGS=()
 have_userlocal=0
 if [[ -d "${USER_LOCAL}" ]]; then
     USER_LOCAL="$(abs "${USER_LOCAL}")" || { echo "error: cannot resolve ${USER_LOCAL}" >&2; exit 1; }
     HOME_ARGS+=(--dir "${HOME_AGENT}/.local" --ro-bind "${USER_LOCAL}" "${HOME_AGENT}/.local")
-    RESERVED_HOME_PATHS+=("${HOME_AGENT}/.local")
     have_userlocal=1
 fi
 
 if [[ -d "${PI_DIR}" ]]; then
     PI_DIR="$(abs "${PI_DIR}")" || { echo "error: cannot resolve ${PI_DIR}" >&2; exit 1; }
     HOME_ARGS+=(--dir "${HOME_AGENT}/.pi" --ro-bind "${PI_DIR}" "${HOME_AGENT}/.pi")
-    RESERVED_HOME_PATHS+=("${HOME_AGENT}/.pi")
     if [[ -w "${PI_DIR}/agent" ]]; then
         HOME_ARGS+=(--dir "${HOME_AGENT}/.pi/agent" --bind "${PI_DIR}/agent" "${HOME_AGENT}/.pi/agent")
     fi
@@ -147,11 +134,9 @@ fi
 # 6. Resolve the active nvm node install (host side) and bind nvm read-only
 resolve_nvm_node_bin() {
     local candidate
-
-    # Preferred: ask nvm which node the "default" alias resolves to.
     if [[ -s "${NVM_DIR_HOST}/nvm.sh" ]]; then
         candidate="$(
-            set +eu                      # nvm.sh is not -u/-e clean
+            set +eu
             export NVM_DIR="${NVM_DIR_HOST}"
             # shellcheck disable=SC1090
             . "$NVM_DIR/nvm.sh" >/dev/null 2>&1
@@ -162,8 +147,6 @@ resolve_nvm_node_bin() {
             return 0
         fi
     fi
-
-    # Fallback: newest installed version, by version sort.
     local -a nodes
     shopt -s nullglob
     nodes=("${NVM_DIR_HOST}"/versions/node/*/bin/node)
@@ -180,11 +163,8 @@ have_nvm=0
 NODE_BIN_DIR_SANDBOX=""
 if [[ -d "${NVM_DIR_HOST}" ]]; then
     NVM_DIR_HOST="$(abs "${NVM_DIR_HOST}")" || { echo "error: cannot resolve ${NVM_DIR_HOST}" >&2; exit 1; }
-
     NVM_ARGS=(--dir "${HOME_AGENT}/.nvm" --ro-bind "${NVM_DIR_HOST}" "${HOME_AGENT}/.nvm")
-    RESERVED_HOME_PATHS+=("${HOME_AGENT}/.nvm")
     have_nvm=1
-
     NODE_BIN="$(resolve_nvm_node_bin || true)"
     if [[ -n "${NODE_BIN}" ]]; then
         NODE_BIN_DIR="$(dirname "${NODE_BIN}")"
@@ -196,30 +176,28 @@ if [[ -d "${NVM_DIR_HOST}" ]]; then
     fi
 fi
 
-# 7. Resolve the extra directory binds (-d) into bwrap arguments
-#
-# A destination is rejected if it would land on a path bwrap already
-# manages (/usr, /etc, /proc, ...), on the sandbox home root itself
-# (mounting there would shadow everything under it), or on one of the
-# specific reserved subpaths recorded above (workspace/.local/.nvm/.pi).
-# Anything else under the sandbox home -- including paths that happen to
-# equal your real $HOME subtree when -u defaults to your host username --
-# is fair game, since that's precisely what lets hardcoded-path binaries
-# keep working.
+# 7. Reserved sandbox-home paths that this script itself binds. -d specs
+#    are not allowed to target these (they'd silently shadow the mounts
+#    set up above); everything else under home is fair game.
+declare -a RESERVED_HOME_PATHS=("${HOME_AGENT}/workspace")
+(( have_userlocal )) && RESERVED_HOME_PATHS+=("${HOME_AGENT}/.local")
+[[ -d "${PI_DIR}" ]] && RESERVED_HOME_PATHS+=("${HOME_AGENT}/.pi")
+(( have_nvm )) && RESERVED_HOME_PATHS+=("${HOME_AGENT}/.nvm")
+
 is_protected_guest() {
-    local guest="$1" r
+    local guest="$1" reserved
     case "${guest}" in
         /|/usr|/usr/*|/etc|/etc/*|/proc|/proc/*|/dev|/dev/*|/sys|/sys/*|/tmp|/tmp/*|/run|/run/*|/boot|/boot/*)
             return 0 ;;
     esac
     [[ "${guest}" == "${HOME_AGENT}" ]] && return 0
-    for r in "${RESERVED_HOME_PATHS[@]}"; do
-        # Overlap in either direction: guest under r, or r under guest.
-        [[ "${guest}" == "${r}" || "${guest}" == "${r}/"* || "${r}" == "${guest}/"* ]] && return 0
+    for reserved in "${RESERVED_HOME_PATHS[@]}"; do
+        [[ "${guest}" == "${reserved}" || "${guest}" == "${reserved}/"* ]] && return 0
     done
     return 1
 }
 
+# 8. Resolve the extra directory binds (-d) into bwrap arguments
 declare -a BIND_ARGS=()
 for spec in "${EXTRA_BINDS[@]}"; do
     mode=--bind
@@ -232,10 +210,8 @@ for spec in "${EXTRA_BINDS[@]}"; do
         host="${spec%%:*}"
         guest="${spec#*:}"
     else
-        # Bare "-d /host/path": mirror it at the SAME absolute path inside
-        # the sandbox (resolved below), instead of an arbitrary /mnt/name.
-        # This is what lets binaries/venvs with hardcoded absolute paths
-        # (e.g. under your real $HOME) keep working unmodified.
+        # Bare "-d /host/path": mirror it at the SAME absolute path
+        # inside the sandbox, instead of an arbitrary /mnt/name.
         host="${spec}"
         guest=""
     fi
@@ -245,11 +221,7 @@ for spec in "${EXTRA_BINDS[@]}"; do
     host="$(abs "${host}")" || { echo "error: cannot resolve: ${host}" >&2; exit 1; }
 
     [[ -n "${guest}" ]] || guest="${host}"
-
-    # Normalize lexically (no filesystem lookup, guest may not exist yet)
-    # so a "../.." in a user-supplied SANDBOX_DIR can't sneak past the
-    # protected-path checks below.
-    guest="$(realpath -m -- "${guest}")"
+    guest="$(realpath -m -- "${guest}")"   # normalize; blocks "../.." tricks
 
     [[ "${guest}" == /* ]] || { echo "error: sandbox path must be absolute: ${guest}" >&2; exit 1; }
     if is_protected_guest "${guest}"; then
@@ -257,22 +229,17 @@ for spec in "${EXTRA_BINDS[@]}"; do
         exit 1
     fi
 
-    # Parent of the destination is created for us by bwrap; keep it tidy anyway
     BIND_ARGS+=(--dir "$(dirname "${guest}")" "${mode}" "${host}" "${guest}")
 done
 
-# 8. Build the in-sandbox PATH
+# 9. Build the in-sandbox PATH
 declare -a PATH_PARTS=()
-if [[ -n "${NODE_BIN_DIR_SANDBOX}" ]]; then
-    PATH_PARTS+=("${NODE_BIN_DIR_SANDBOX}")   # node/npm/npx from nvm
-fi
-if (( have_userlocal )); then
-    PATH_PARTS+=("${HOME_AGENT}/.local/bin")
-fi
+[[ -n "${NODE_BIN_DIR_SANDBOX}" ]] && PATH_PARTS+=("${NODE_BIN_DIR_SANDBOX}")
+(( have_userlocal )) && PATH_PARTS+=("${HOME_AGENT}/.local/bin")
 PATH_PARTS+=(/usr/local/bin /usr/bin /bin)
 SANDBOX_PATH="$(IFS=:; printf '%s' "${PATH_PARTS[*]}")"
 
-# 9. Environment for the sandbox (explicit whitelist; --clearenv below)
+# 10. Environment for the sandbox (explicit whitelist; --clearenv below)
 declare -a ENV_ARGS=(
     --setenv PATH "${SANDBOX_PATH}"
     --setenv HOME "${HOME_AGENT}"
@@ -283,19 +250,14 @@ declare -a ENV_ARGS=(
 )
 if (( have_nvm )); then
     ENV_ARGS+=(--setenv NVM_DIR "${HOME_AGENT}/.nvm")
-    if [[ -n "${NODE_BIN_DIR_SANDBOX}" ]]; then
-        ENV_ARGS+=(--setenv NVM_BIN "${NODE_BIN_DIR_SANDBOX}")
-    fi
+    [[ -n "${NODE_BIN_DIR_SANDBOX}" ]] && ENV_ARGS+=(--setenv NVM_BIN "${NODE_BIN_DIR_SANDBOX}")
 fi
 if [[ -n "${PI_PROXY:-}" ]]; then
-    # Routing, not isolation: only inject if a proxy actually exists
     ENV_ARGS+=(--setenv HTTP_PROXY "${PI_PROXY}" --setenv HTTPS_PROXY "${PI_PROXY}"
                --setenv NO_PROXY "localhost,127.0.0.1")
 fi
 
-# 10. Execute the sandbox
-# --unshare-all = user-try, ipc, pid, net, uts, cgroup-try [^739a73#118-120]
-# --share-net then retains host networking (outbound internet stays on) [^739a73#122-124]
+# 11. Execute the sandbox
 exec bwrap \
     --unshare-all \
     --share-net \
