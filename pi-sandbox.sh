@@ -42,7 +42,8 @@ Usage: $(basename "$0") [-w WORKSPACE] [-u USER] [-d HOST_DIR[:SANDBOX_DIR]] [--
                           ro:/host/path[:/sandbox]   -> read-only bind
                         May be given multiple times. Destinations under
                         /usr, /etc, /proc, /dev, /sys, /tmp, /run, /boot,
-                        or the sandbox's own home directory are rejected.
+                        or already used by this script (the sandbox home
+                        root, workspace, .local, .nvm, .pi) are rejected.
 
   -h, --help            Show this help and exit.
 
@@ -95,11 +96,11 @@ if [[ ${#AGENT_ARGS[@]} -eq 0 ]]; then AGENT_ARGS=(/bin/bash); fi
 # 2. Resolve the sandbox identity (username -> $HOME inside the sandbox)
 #
 # Default to the real host username. This is *less* isolated than a fixed
-# generic name (it exposes who you are, and -d binds under your real home
-# now land at their real path -- see step 6), but compiled binaries,
-# virtualenvs, and npm shebangs frequently embed an absolute $HOME-based
-# path and simply fail to run under a different one. Use -u/--user to opt
-# back into a generic, safer identity (e.g. -u agent).
+# generic name (it exposes who you are, and it means -d binds that happen
+# to fall under your real home now land at their real path -- see step 7),
+# but compiled binaries, virtualenvs, and npm shebangs frequently embed an
+# absolute $HOME-based path and simply fail to run under a different one.
+# Use -u/--user to opt back into a generic, safer identity (e.g. -u agent).
 SANDBOX_USER="${SANDBOX_USER:-${USER:-$(id -un 2>/dev/null || echo agent)}}"
 
 # The username is embedded straight into a filesystem path below, so it
@@ -116,18 +117,28 @@ mkdir -p "${PI_DIR}/agent/sessions" "${WORKSPACE}"
 # 4. bwrap requires absolute paths
 WORKSPACE="$(abs "${WORKSPACE}")" || { echo "error: cannot resolve workspace: ${WORKSPACE}" >&2; exit 1; }
 
+# Track sandbox-home subpaths this script itself binds, so step 7 can
+# refuse to let a user-supplied -d silently shadow them. Only these exact
+# subtrees are reserved -- NOT the whole of ${HOME_AGENT} -- because when
+# --user defaults to your real username, ${HOME_AGENT} equals your actual
+# $HOME, and unrelated directories under it (e.g. ~/ros2_ws) must remain
+# bindable.
+declare -a RESERVED_HOME_PATHS=("${HOME_AGENT}/workspace")
+
 # 5. Dotdirs into the sandbox home
 declare -a HOME_ARGS=()
 have_userlocal=0
 if [[ -d "${USER_LOCAL}" ]]; then
     USER_LOCAL="$(abs "${USER_LOCAL}")" || { echo "error: cannot resolve ${USER_LOCAL}" >&2; exit 1; }
     HOME_ARGS+=(--dir "${HOME_AGENT}/.local" --ro-bind "${USER_LOCAL}" "${HOME_AGENT}/.local")
+    RESERVED_HOME_PATHS+=("${HOME_AGENT}/.local")
     have_userlocal=1
 fi
 
 if [[ -d "${PI_DIR}" ]]; then
     PI_DIR="$(abs "${PI_DIR}")" || { echo "error: cannot resolve ${PI_DIR}" >&2; exit 1; }
     HOME_ARGS+=(--dir "${HOME_AGENT}/.pi" --ro-bind "${PI_DIR}" "${HOME_AGENT}/.pi")
+    RESERVED_HOME_PATHS+=("${HOME_AGENT}/.pi")
     if [[ -w "${PI_DIR}/agent" ]]; then
         HOME_ARGS+=(--dir "${HOME_AGENT}/.pi/agent" --bind "${PI_DIR}/agent" "${HOME_AGENT}/.pi/agent")
     fi
@@ -171,6 +182,7 @@ if [[ -d "${NVM_DIR_HOST}" ]]; then
     NVM_DIR_HOST="$(abs "${NVM_DIR_HOST}")" || { echo "error: cannot resolve ${NVM_DIR_HOST}" >&2; exit 1; }
 
     NVM_ARGS=(--dir "${HOME_AGENT}/.nvm" --ro-bind "${NVM_DIR_HOST}" "${HOME_AGENT}/.nvm")
+    RESERVED_HOME_PATHS+=("${HOME_AGENT}/.nvm")
     have_nvm=1
 
     NODE_BIN="$(resolve_nvm_node_bin || true)"
@@ -186,18 +198,26 @@ fi
 
 # 7. Resolve the extra directory binds (-d) into bwrap arguments
 #
-# A destination is rejected if it would shadow a path bwrap already manages
-# (/usr, /etc, /proc, ...) or if it overlaps the sandbox's own home tree --
-# clobbering the latter would silently undo the .local/.nvm/.pi binds above.
+# A destination is rejected if it would land on a path bwrap already
+# manages (/usr, /etc, /proc, ...), on the sandbox home root itself
+# (mounting there would shadow everything under it), or on one of the
+# specific reserved subpaths recorded above (workspace/.local/.nvm/.pi).
+# Anything else under the sandbox home -- including paths that happen to
+# equal your real $HOME subtree when -u defaults to your host username --
+# is fair game, since that's precisely what lets hardcoded-path binaries
+# keep working.
 is_protected_guest() {
-    local guest="$1"
+    local guest="$1" r
     case "${guest}" in
         /|/usr|/usr/*|/etc|/etc/*|/proc|/proc/*|/dev|/dev/*|/sys|/sys/*|/tmp|/tmp/*|/run|/run/*|/boot|/boot/*)
             return 0 ;;
     esac
-    # Slash-bounded comparison so e.g. HOME_AGENT=/home/bob doesn't also
-    # (mis)match an unrelated /home/bobby.
-    [[ "${guest}" == "${HOME_AGENT}" || "${guest}" == "${HOME_AGENT}/"* || "${HOME_AGENT}" == "${guest}/"* ]]
+    [[ "${guest}" == "${HOME_AGENT}" ]] && return 0
+    for r in "${RESERVED_HOME_PATHS[@]}"; do
+        # Overlap in either direction: guest under r, or r under guest.
+        [[ "${guest}" == "${r}" || "${guest}" == "${r}/"* || "${r}" == "${guest}/"* ]] && return 0
+    done
+    return 1
 }
 
 declare -a BIND_ARGS=()
