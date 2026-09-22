@@ -226,6 +226,7 @@ exec bwrap \
     --symlink usr/bin /bin \
     --symlink usr/sbin /sbin \
     --ro-bind /etc /etc \
+    --ro-bind /opt/ros /opt/ros \
     --proc /proc \
     --dev /dev \
     --size 2147483648 \
